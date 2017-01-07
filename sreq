@@ -1,0 +1,937 @@
+#!/usr/local/bin/ruby -w
+# $Id: sreq,v 1.15 2003/10/21 19:38:22 agriffis Exp $
+#
+# sreq: command-line srequest browser
+
+require 'getoptlong'
+require 'weakref'
+require 'net/http'
+require 'cgi'
+require 'tempfile'
+
+# Global variables
+$opts       = Hash.new
+$action     = false
+$filter     = false
+$debug      = false
+$verbose    = false
+$getcols    = nil
+$TIOCGWINSZ = nil
+$version    = '$Revision: 1.15 $'.split(' ')[1]
+
+def usage(exitcode = 0)
+  s = <<-'END_OF_USAGE'
+    usage: sreq [ -bflqahV ] [-Q num] pool-nnn-user...
+
+    Listings:
+
+               --full          Display full text (default)
+        -f     --files         Display file list
+        -l     --list          Display simple list
+        -q     --qars          Display QAR list
+        -a     --abstract      Display abstract list
+        -s     --submits       Display submit history
+
+    Actions:  (* denotes action which will modify srequest)
+
+      * -B     --add-siblings  Add sibling list
+      * -d     --duplicate     Duplicate a section between srequests
+        -S     --signoff       Sign off using webss.cgi
+
+    Modifiers:
+
+        -b           --siblings  Include siblings in the list
+        -Q num       --qar       Filter by srequest addressing QAR num
+        -F filename  --file      Filter by srequest modifying file
+        --grep patt              Filter by srequest with patt in body
+
+    Other options:
+
+               --debug         Debug output
+        -h     --help          Show this help message
+        -v     --verbose       Verbose output
+        -V     --version       Show version information
+
+    See the documentation at http://lan.zk3.dec.com/util/sreq/sreq.html
+    and report bugs to Aron Griffis <agriffis@zk3.dec.com>
+    END_OF_USAGE
+  print s.gsub(/^    /m,'')
+  exit exitcode
+end
+
+def die(msg = nil)
+  $stderr.puts "#{$0}: %s" % (msg || "fatal error")
+  exit 1
+end
+
+def dputs(*msg)
+  $stderr.puts(*msg) if $debug
+end
+
+def vputs(*msg)
+  $stderr.puts(*msg) if $verbose
+end
+
+def getcols
+  return $getcols if $getcols
+  return 132 unless $stdout.isatty
+
+  # There's no POSIX::uname to figure out what the underlying system
+  # is, so we have to call the external `uname`.
+  case `uname -s -m`
+    when /^OSF1/ # Tru64
+      dputs "Recognized Tru64 UNIX"
+      $TIOCGWINSZ = 0x40000000 | ((8 & 0x1fff) << 16) | (116 << 8) | 104
+    when /^Linux alpha/
+      dputs "Recognized Linux/alpha"
+      $TIOCGWINSZ = 0x40087468
+    when /^Linux/ # hopefully x86
+      dputs "Recognized Linux/x86"
+      $TIOCGWINSZ = 0x5413
+    else
+      $TIOCGWINSZ = nil # don't know this OS
+  end
+
+  # Allocate space for the return data prior to calling ioctl.
+  str = [ 0, 0, 0, 0 ].pack('S4')
+  if $stdout.ioctl($TIOCGWINSZ, str) >= 0 then
+    rows, $getcols, xpixels, ypixels = str.unpack('S4')
+    dputs "Terminal has #{$getcols} columns"
+  else
+    dputs "Unable to get window size, using 80 columns"
+    $getcols = 80
+  end
+  return $getcols
+end
+
+class Sreq
+  attr_reader :id, :fn, :pool, :num, :user
+  @@http = nil
+
+  # Big pitfall here for Perl people... 
+  # Ruby's /.*/  == Perl's /.*/m
+  # Ruby's /.*/m == Perl's /.*/ms
+
+  ABSTRACT_RE = %r{
+    ^(?: o.Submit.Abstract |          # devel form
+         1a\).Patch.Announ )          # support form
+     .*?\n\s*                         # skip leading whitespace
+     (\S.*?)\n                        # everything up to the newline
+  }mx
+
+  QARS_RE = %r{
+    ^(?: o.This.submit.is.in.respo |  # devel/indep form
+         CLD/QAR/SPR )                # support form
+     .*?[-=]+\n                       # skip leading whitespace and ----
+     (.*?)                            # grab the QARs
+     \s*                              # skip trailing whitespace
+    ^(?: o\s |                        # indep form end marker
+         SSRT.information |           # support form end marker
+         ..-.Feature.tag )            # devel form end marker
+  }mx
+
+  FILES_RE = %r{
+    ^(?: o.Version.id's.of.files: |   # indep form
+         o.List.of.files.to.be.sub |  # devel form
+         5b\).List.Source.files )     # support form
+     .*?\n\s*                         # skip leading whitespace
+     (.*?)                            # grab files
+     \s*                              # skip trailing whitespace
+    ^(?: o\s |                        # devel/indep form end marker
+         \s*======= )                 # support form end marker
+  }mx
+
+  SIBLINGS_RE = %r{
+    ^2f\)\s*Sibling.Srequest          # support form (only form with siblings)
+     .*?\n\s*                         # skip leading whitespace
+     (.*?)                            # grab siblings
+     \s*=======                       # support form end marker
+  }mx
+
+  COMMENTS_RE = %r{
+    ^1\).Comments                     # support form (only form with comments)
+     \s*                              # skip leading whitespace
+     (.*?)                            # grab comments
+     \s*                              # skip trailing whitespace
+    ^Category\n-------                # support form end marker
+   }mx
+
+
+  def initialize(fn_or_id)
+    if fn_or_id.include? '/'
+      # We were passed a filename
+      @fn, @id = fn_or_id, fn_or_id.sub(/.*\//, '')
+    else
+      # We were passed an id
+      p = fn_or_id.sub(/-.*/, '')
+      fns = Dir["/usr/sde/osf1/build/#{p}/logs/srequest/*/#{fn_or_id}"]
+      if fns.empty?
+        $stderr.puts "warning: can't find #{fn_or_id}"
+        return nil
+      end
+      @id, @fn = fn_or_id, fns[0]  # why would there be more?
+    end
+    @pool, @num, @user = [ @id.split('-'), '*', '*' ].flatten
+    @abstract = nil
+    @comments = nil
+    @qars     = nil
+    @edittext = nil
+    @files    = nil
+    @grep     = nil
+    @patt     = nil
+    @siblings = nil
+    @submits  = nil
+    @stat     = nil  # File::stat object
+    @text     = nil
+  end
+
+  def <=>(other)
+    # Compare pool lexically then num numerically
+    return @pool <=> other.pool if @pool != other.pool
+    return @num.to_i <=> other.num.to_i
+  end
+
+  def to_s
+    return @id
+  end
+
+  def abstract
+    unless @abstract
+      @abstract = (self.text_no_cb =~ ABSTRACT_RE) ? $1 : ''
+      @abstract.tr_s!(" \t", " ")  # collapse whitespace
+    end
+    return @abstract
+  end
+
+  def comments
+    unless @comments
+      @comments = (self.text_no_cb =~ COMMENTS_RE) ? $1 : ''
+    end
+    return @comments
+  end
+
+  def files
+    unless @files
+      files_section = (self.text_no_cb =~ FILES_RE) ? $1 : ''
+      dputs "FILES_RE found:\n%s" % 
+        (files_section.empty? ? "(nothing)\n" : files_section)
+      @files = files_section.scan(/^\[\s*(\S+)\s*\]/m).flatten
+    end
+    return @files
+  end
+
+  def grep(patt)
+    unless @patt == patt
+      if patt[0] == '^'
+        this_re = Regexp.new(patt)
+      else
+        this_re = Regexp.new('^.*'+patt+'.*')
+      end
+      @grep = self.text_no_cb.scan(this_re)
+      @patt = patt
+    end
+    return @grep
+  end
+
+  def siblings
+    unless @siblings
+      sibling_section = (self.text_no_cb =~ SIBLINGS_RE) ? $1 : ''
+      @siblings = sibling_section.scan(/\S+-\d+-\S+/)
+    end
+    return @siblings
+  end
+
+  def qars
+    unless @qars
+      qar_section = (self.text_no_cb =~ QARS_RE) ? $1 : ''
+      dputs "QAR_RE found:\n%s" % 
+        (qar_section.empty? ? "(nothing)\n" : qar_section)
+      @qars = qar_section.scan(/^\S+/m)   # find QAR/IPMT numbers
+    end
+    return @qars
+  end
+
+  def submits
+    unless @submits
+      @submits = []
+      [ "monitor_submit.log", "monitor_kitbld.log" ].each { |s|
+        begin
+          File.open("/usr/sde/osf1/build/#{@pool}/logs/#{s}") { |f|
+            f.each("\n\n") { |para|
+              @submits.push(para.strip) if para.include?(@id)
+            }
+          }
+        rescue Errno::ENOENT
+          # This isn't quite right because the monitor_kitbld.log file exists
+          # only in the kitbld directory, not in the base pool directory.  Oh
+          # well.
+          #@submits.push "No #{s} exists for #{@pool}"
+        end
+      }
+    end
+    return @submits
+  end
+
+  def text
+    # This should use mmap when we have that available for ruby.
+    # For the moment use weak references, which allows a sort of caching.  The
+    # garbage collector is allow to free up this memory, in which case we have
+    # to fetch it again.
+    begin
+      raise WeakRef::RefError unless @text # test for initial nil
+      t = @text.to_s                       # might raise WeakRef:RefError
+    rescue WeakRef::RefError
+      t = File.new(@fn, 'r').read          # snarf the entire file
+      @text = WeakRef.new(t)               # cache it using a weak reference
+      dputs "text = %d bytes" % t.length
+    end
+    return t    # return strong reference to real text
+  end
+
+  def text_no_cb
+    # The text without changebars
+    text.gsub(/^\| /m, '')
+  end
+
+  def signoff
+    # connect to web host unless we already have a matching http object
+    @@http = Net::HTTP.new('reng.zk3.dec.com', 80) unless @@http
+
+    headers = {
+      'Content-Type' => 'application/x-www-form-urlencoded',
+      'UserAgent'    => 'sreq',
+      'Referer'      => 'http://reng.zk3.dec.com/~webss/webss.html',
+    }
+
+    data = {
+      'email'        => ENV['USER'] + '@zk3.dec.com',
+      'srequest'     => id,
+      'validate'     => 'YES',
+    }
+    data = data.map { |k,v|
+      '%s=%s' % [CGI.escape(k), CGI.escape(v || '')]
+    }.join('&')
+
+    resp = @@http.post('/~webss/webss.cgi', data, headers)
+    resp = resp[0] if resp.kind_of? Array
+    resp.body =~ /VERIFIED/ or die resp.body
+  end
+
+  def read_edittext
+    # Use weak references, which allows a sort of caching.  The
+    # garbage collector is allow to free up this memory, in which case
+    # we have to fetch it again.
+    begin
+      raise WeakRef::RefError unless @edittext # test for initial nil
+      t = @text.to_s                           # might raise WeakRef:RefError
+    rescue WeakRef::RefError
+      # Collect the text using srequest with "cat" as the EDITOR.
+      # The carriage returns keep the unmodified email information plus
+      # the "Press enter when finished editing"
+      t = IO.popen('printf "\n\n\n\nquit\n" | env EDITOR=cat srequest ' +
+        "-update #{self.id} -tree #{self.pool} -nofill -term").gets(nil)
+      t.sub!(/\A.*?Enter additional cc mailing list \[.*?\]: /m, '')
+      t.sub!(/Press the return key when edit is finished:.*?\Z/m, '')
+      t.freeze
+
+      # Cache it using a weak reference
+      @edittext = WeakRef.new(t)
+      dputs "edittext = %d bytes" % t.length
+    end
+    return t    # return strong reference to real edittext
+  end
+
+  def write_edittext(newtext)
+    # Create a temporary file which will overwrite the srequest
+    f = Tempfile.new('sreq.')
+    f.write newtext
+    f.close
+
+    # Run srequest to "edit" the text
+    system("yes '' | env EDITOR='cp #{f.path}' srequest " +
+      "-update #{self.id} -tree #{self.pool} -nofill -term")
+
+    # Remove the temporary file
+    File.unlink(f.path)
+  end
+
+  def modify(fields)
+    # Easiest way to do this is to fetch the text in one pass, make
+    # the changes, and replace the text in a second pass.  This isn't
+    # as efficient (since srequest is pretty slow) as doing it in a
+    # single pass, but that would require calling an editor (such as
+    # this script) and passing in the text to replace.  Too much work.
+    #
+    # fields should be a hash where the keys are the field name from
+    # the -text version of srequest
+    t = read_edittext.dup
+    f1 = nil
+    f2 = nil
+
+    if ($verbose)
+      f1 = Tempfile.new('sreq-old.')
+      f1.write t
+      f1.close
+    end
+
+    fields.each { |fname,ftext|
+      ftext = ftext.sub(/\n?\Z/, "\n")  # terminate with a newline
+      delim = '^- [- ]*- ' + Regexp.escape(fname) + "\n"
+      re = /(#{delim}).*?#{delim}/m
+      unless t.sub!(re) { $1 + ftext + $1 }
+        $stderr.puts "warning: #{self.id} does not contain #{fname}"
+      end
+    }
+
+    # Show the diffs if verbose
+    if ($verbose)
+      f2 = Tempfile.new('sreq-new.')
+      f2.write t
+      f2.close
+      system "diff -C 3 #{f1.path} #{f2.path}"
+      File.unlink(f1.path)
+      File.unlink(f2.path)
+    end
+
+    # Second pass to write back the modified srequest
+    #dputs "t = %s" % t
+    self.write_edittext(t)
+  end
+end
+
+class Sreqlist
+  def initialize(*ids)
+    add(ids) unless ids.empty?
+  end
+
+  def add(*ids)
+    ids.flatten!  # most of the time ARGV is passed, so we get [[patt]]
+    vputs "Building Sreqlist from #{ids.join(' ')}" 
+    @sreqs = Hash.new
+    ids.each do |id|
+      dputs "working on #{id}" 
+      pool, num, user = [ id.split('-'), '*', '*' ].flatten
+
+      # Make sure the regex matched
+      if pool.empty?
+        $stderr.puts "warning: can't parse #{id}"
+        next
+      end
+
+      # Blanks can be used as shortcuts for num and user, but they won't work
+      # in the glob.
+      if num.empty?  then num  = '*' end
+      if user.empty? then user = '*' end
+      id_glob = "#{pool}-#{num}-#{user}"
+      dputs "pool=[#{pool}] num=[#{num}] user=[#{user}]" 
+
+      # Glob to get the pools.  Pare down the matches so that only submit
+      # pools are checked.  The assumption is that submit pools don't contain
+      # a dot in the directory name (.); this may not always be true.
+      dirs = Dir["/usr/sde/osf1/build/#{pool}"].reject {|x| x.include? '.'}
+      if dirs.empty?
+        $stderr.puts "warning: no matching pool for #{pool}"
+        next
+      end
+      dputs "matching submit pools are:\n %s" % dirs.join("\n ")
+
+      # Glob to get the files.  This seems to be faster than calling "find"
+      found = false
+      dirs.each do |d|
+        files = Dir["#{d}/logs/srequest/*/#{id_glob}"]
+        next if files.empty?
+        found = true
+        dputs "matching files are:\n %s" % files.join("\n ")
+
+        # Create a new Sreq instance for each file
+        files.each { |f| 
+          if s = Sreq.new(f)
+            @sreqs[s.id] = s
+          end
+        }
+      end
+
+      $stderr.puts "warning: no matches for #{id_glob}" unless found
+    end
+  end
+
+  def filter_siblings!
+    sibs = @sreqs.collect {|id,s| s.siblings}.flatten.uniq
+    # Remove the entries we already have in @sreqs
+    sibs.reject! {|sib| @sreqs.has_key? sib}
+    dputs "Adding siblings:", sibs.map {|s| " #{s}"}
+    # Now add the remaining entries to @sreqs
+    sibs.each {|id|
+      if s = Sreq.new(id)
+        @sreqs[s.id] = s
+      end
+    }
+  end
+
+  def filter_qar!(this_q)
+    # Reject sreqs that do NOT include this_q
+    @sreqs.reject! { |id,s| not s.qars.include? this_q }
+  end
+
+  def filter_file!(this_f)
+    # Reject sreqs that do NOT include this_f
+    @sreqs.reject! { |id,s| 
+      not s.files.find { |f| f.sub(/.*\//, '') == this_f }
+    }
+  end
+
+  def filter_grep!(this_patt)
+    @sreqs.reject! { |id,s|
+      # Reject sreqs that do NOT include this_patt
+      grep_output = s.grep(this_patt)
+      if $debug
+        $stderr.puts "filter_grep! %s %s (/%s/ = %s)" % 
+          [ grep_output.empty? ? "dropping" : "keeping",
+            id, this_patt, grep_output ]
+      end
+      grep_output.empty?
+    }
+  end
+
+  def output_abstract
+    # Restrict to screen width
+    w = getcols
+    @sreqs.values.sort.each { |s|
+      printf "%-#{w}.#{w}s\n" % "#{s.id}: #{s.abstract}"
+    }
+  end
+
+  def output_files
+    @sreqs.values.sort.each { |s|
+      print "%s:\n\t%s\n\n" % [ s.id, s.files.join("\n\t") ]
+    }
+  end
+
+  def output_grep
+    # Restrict to screen width
+    w = getcols
+    @sreqs.values.sort.each { |s|
+      s.grep($opts['grep']).each { |line|
+        printf "%-#{w}.#{w}s\n" % "#{s.id}: #{line}"
+      }
+    }
+  end
+
+  def output_list
+    # Don't use @sreqs.keys.sort because it doesn't sort right...
+    puts @sreqs.values.sort
+  end
+
+  def output_qars
+    @sreqs.values.sort.each { |s|
+      puts "#{s.id}: #{s.qars.join(' ')}"
+    }
+  end
+
+  def output_submits
+    @sreqs.values.sort.each { |s|
+      puts "=" * s.id.length, s.id, "=" * s.id.length
+      print s.submits.join("\n\n"), "\n\n"
+    }
+  end
+
+  def output_text
+    return if @sreqs.empty?  # sanity check
+    # If on a terminal, then use a pager to display.  Otherwise pretty-print
+    # to stdout.
+    if $stdout.isatty
+      files = @sreqs.values.sort.collect { |s| s.fn }
+      pager = ENV['PAGER'] || 'more'
+      dputs "Running xargs #{pager} with stdin of #{files.join(' ')}"
+      IO.popen("xargs #{pager}", "w") { |p|
+        p.puts files.join(' ')
+      }
+    else
+      @sreqs.values.sort.each { |s|
+        puts "=" * s.id.length, s.id, "=" * s.id.length
+        print "#{s.text}\n\n"  # extra newline to separate
+      }
+    end
+  end
+
+  def add_siblings
+    sibs = @sreqs.keys.sort { |a,b|
+      pcomp = %w(indepos v51c v51b v51a v51 v50a v50 v40g v40f v40e v40d)
+      ap = a.sub(/(supportos)?-.*/, '')
+      bp = b.sub(/(supportos)?-.*/, '')
+      if ap == bp or pcomp.index(ap).nil? or pcomp.index(bp).nil?
+        a <=> b
+      else
+        pcomp.index(ap) <=> pcomp.index(bp)
+      end
+    }.join("\n") + "\n"
+
+    @sreqs.values.sort.each { |s|
+      coms = s.comments.strip
+      coms += Time.new.localtime.strftime "\n%d %b %Y - add siblings\n"
+      mods = { 
+        'comments' => coms,
+        'sibling_srequests' => sibs
+      }
+      s.modify(mods)
+    }
+  end
+
+  def duplicate(dupe)
+    # Get the editor text, which is different from the formatted text
+    dupecontent = dupe.read_edittext
+
+    # Find the requested fields
+    dupeinfo = Hash.new
+    $opts['duplicate'].each { |field|
+      delim = '^- [- ]*- ' + Regex.escape(field) + "\n"
+      re = /#{delim}(.*?)#{delim}/m
+      if dupecontent =~ re
+        dupeinfo[field] = $1
+      else
+        die "field #{field} not found in #{dupe.id}"
+      end
+    }
+
+    # Edit each of the srequests, duplicating sections from dupeinfo
+    @sreqs.values.sort.each { |s|
+      s.modify(dupeinfo)
+    }
+  end
+
+  def signoff
+    @sreqs.values.sort.each { |s|
+      s.signoff
+    }
+  end
+
+  def [](idx)
+    @sreqs.values.sort[idx]
+  end
+
+  def length
+    @sreqs.length
+  end
+
+  def empty?
+    @sreqs.empty?
+  end
+
+  def to_s
+    # Simple list output (unsorted)
+    @sreqs.keys.join("\n")
+  end
+end
+
+# Parse the command-line options
+begin
+  GetoptLong.new(
+    [ '--abstract',     '-a', GetoptLong::NO_ARGUMENT ],
+    [ '--add-siblings', '-B', GetoptLong::NO_ARGUMENT ],
+    [ '--siblings',     '-b', GetoptLong::NO_ARGUMENT ],
+    [ '--duplicate',    '-d', GetoptLong::REQUIRED_ARGUMENT ],
+    [ '--full',               GetoptLong::NO_ARGUMENT ],
+    [ '--files',        '-f', GetoptLong::NO_ARGUMENT ],
+    [ '--file',         '-F', GetoptLong::REQUIRED_ARGUMENT ],
+    [ '--help',               GetoptLong::NO_ARGUMENT ],
+    [ '--list',         '-l', GetoptLong::NO_ARGUMENT ],
+    [ '--qars',         '-q', GetoptLong::NO_ARGUMENT ],
+    [ '--qar',          '-Q', GetoptLong::REQUIRED_ARGUMENT ],
+    [ '--grep',               GetoptLong::REQUIRED_ARGUMENT ],
+    [ '--signoff',      '-S', GetoptLong::NO_ARGUMENT ],
+    [ '--submits',      '-s', GetoptLong::NO_ARGUMENT ],
+    [ '--verbose',            GetoptLong::NO_ARGUMENT ],
+    [ '--debug',              GetoptLong::NO_ARGUMENT ],
+    [ '--crazy',              GetoptLong::NO_ARGUMENT ],
+    [ '--test',               GetoptLong::REQUIRED_ARGUMENT ],
+    [ '--version',      '-V', GetoptLong::NO_ARGUMENT ]
+  ).each do |opt,arg|
+    case opt
+    when '--help';         usage
+    when '--add-siblings'; $action = true
+    when '--debug';        $verbose = true; $debug = true
+    when '--duplicate'
+      ($opts['duplicate'] ||= Array.new) << arg
+      $action = true
+      next
+    when '--file';         $filter = true
+    when '--grep';         $filter = true
+    when '--qar';          $filter = true
+    when '--siblings';     $filter = true
+    when '--signoff';      $action = true
+    when '--test';         $verbose = true; $debug = true; send(arg); exit 0
+    when '--verbose';      $verbose = true
+    when '--version';      puts "sreq version #{$version}"; exit 0
+    end
+    $opts[opt.slice(2..-1)] = arg;  # i.e. abstract="", qar=94030
+  end
+rescue GetoptLong::InvalidOption
+  # GetoptLong has already printed the error message on $stderr
+  exit 1
+end
+
+# GetoptLong returns unparsed options in ARGV, so that's where the srequest
+# id patterns will be.  For --duplicate, need to collect the first id
+# on the cmdline
+die "argument required" if ARGV.empty?
+if $opts['duplicate']
+  dupe = Sreqlist.new(ARGV[0])
+  die "empty duplicate Sreqlist" if dupe.length != 1
+  dupe = dupe[0]
+  slist = Sreqlist.new(ARGV[1, ARGV.length-1])
+else
+  slist = Sreqlist.new(ARGV)
+end
+die "empty Sreqlist" if slist.empty?
+
+# Actions and filters can't be mixed
+if $action and $filter and not $opts['crazy']
+  die "actions and filters can't be mixed... sorry!"
+end
+
+# For actions, require a 1-to-1 match between ids on the
+# command-line and resolved srequests (for safety's sake)
+if $action and ARGV.length != slist.length and not $opts['crazy']
+  die "action requires a 1-to-1 match from ARGV to srequests"
+end
+
+# Run requested filters
+slist.filter_qar!($opts['qar'])   if $opts['qar']
+slist.filter_file!($opts['file']) if $opts['file']
+slist.filter_grep!($opts['grep']) if $opts['grep']
+slist.filter_siblings!            if $opts['siblings']
+
+# Run the appropriate output routine
+if    $opts['signoff']      then slist.signoff
+elsif $opts['add-siblings'] then slist.add_siblings
+elsif $opts['duplicate']    then slist.duplicate(dupe)
+elsif $opts['abstract']     then slist.output_abstract
+elsif $opts['files']        then slist.output_files
+elsif $opts['list']         then slist.output_list
+elsif $opts['qars']         then slist.output_qars
+elsif $opts['submits']      then slist.output_submits
+elsif $opts['grep'] and not $opts['full'] then slist.output_grep
+else slist.output_text
+end
+
+__END__
+
+$Log: sreq,v $
+Revision 1.15  2003/10/21 19:38:22  agriffis
+fix QAR_RE
+
+Revision 1.14  2003/10/21 18:41:56  agriffis
+really use reng.zk3.dec.com for signoffs
+add --crazy to GetoptLong.new
+
+Revision 1.13  2003/10/16 20:03:27  agriffis
+add --add-siblings, --duplicate
+fix --file (I think)
+fix --grep
+fix a regex problem when there are no siblings
+add edittext stuff
+update man-page for all of the above
+
+Revision 1.12  2003/09/04 20:38:58  agriffis
+add linux/alpha term width sequence
+add text_no_cb and change regexes to suit
+add output_grep
+fix qar and file searching
+add signoff support
+port to ruby-1.8 (ARGV is now frozen)
+
+Revision 1.11  2003/01/07 21:56:22  agriffis
+removed race from weak references
+
+Revision 1.10  2003/01/07 19:38:37  chouser
+Fix text cacheing
+
+Revision 1.9  2002/08/18 01:50:49  agriffis
+added $version so that --version works
+
+Revision 1.8  2002/08/18 01:29:52  agriffis
+Rewrote in ruby
+
+
+=head1 NAME
+
+sreq - command-line srequest browser
+
+=head1 SYNOPSIS
+
+sreq [ -abBdflqsSV ] 
+[ --abstract --add-siblings --crazy --debug --duplicate --files --help 
+--list --qars --siblings --signoff --submits --verbose --version ] 
+[ -F I<filename> | --file I<filename> ] 
+[ --grep I<patt> ]
+[ -Q I<num> | --qar I<num> ] 
+pool-nnn-user...
+
+=head1 OPTIONS
+
+=over
+
+=item B<-a --abstract>
+
+Output in abstract list format, one srequest per line with abstracts.
+
+=item B<-b --siblings>
+
+Include siblings in the output.
+
+=item B<-B --add-siblings>
+
+Automatically edit each of the srequests listed on the command-line,
+replacing the siblings in the srequest with the list from the
+command-line.  Like B<--signoff>, this requires
+a 1-to-1 match between ARGV and srequests unless B<--crazy> is given
+(but don't do that).
+
+Note this option requires you be in an ode workon session.
+
+=item B<--crazy>
+
+Allow id patterns to resolve to multiple srequests for
+B<--add-siblings>, B<--duplicate> and B<--signoff>.  Don't use this
+option unless you're really certain about it, and don't blame me for
+the fallout!
+
+=item B<--debug>
+
+Run in debugging mode.
+
+=item B<-d> I<section> B<--duplicate> I<section>
+
+Duplicate a section from the first id listed to the remainder on the
+line.  This option can be given multiple times on the command-line to
+duplicate multiple sections at once.  Like B<--signoff>, this requires
+a 1-to-1 match between ARGV and srequests unless B<--crazy> is given
+(but don't do that).
+
+Note this option requires you be in an ode workon session.
+
+=item B<-f --files>
+
+Output files modified by the srequests.  Note that this is
+only as accurate as the srequest text.
+
+=item B<--grep> I<patt>
+
+Output files whose body text contain the specified regular expression
+pattern.  NOTE: This changes the output format to be similar to grep's
+output.  You need to specify --full if you actually want the matching
+srequests to be displayed.
+
+=item B<--help>
+
+Show usage information.
+
+=item B<-l --list>
+
+Output a simple list of matching srequests.
+
+=item B<-q --qars>
+
+Show the QARs handled by each matching srequest.
+
+=item B<-S --signoff>
+
+Signoff the srequests via the form at
+http://renguru.zk3.dec.com/~webss/webss.html . Note this requires a
+1-to-1 match between ARGV and srequests unless B<--crazy> is given, so
+you can't accidentally sign off a large number of srequests
+(v51bsupportos-*-* won't work, in other words).
+
+=item B<-s --submits>
+
+Show the submit history for each matching srequest.
+
+=item B<-F> I<filename> B<--file> I<filename>
+
+Filter srequests on file modified by the srequest.  pool-nnn-user is still
+required to determine where to look.
+
+=item B<-Q> I<num> B<--qar> I<num>
+
+File srequests on QAR number.  pool-nnn-user is still required to determine
+where to look.
+
+=item B<--verbose>
+
+Run in verbose mode.
+
+=item B<-V --version>
+
+Show version information.
+
+=back
+
+=head1 DESCRIPTION
+
+This tool provides a command-line interface for looking up srequests.  It uses
+the information publicly available in /usr/sde/osf1/build/*/logs.
+
+=head1 EXAMPLES
+
+To view a given srequest:
+
+  $ sreq wcalphaos-633-agriffis
+  [pager starts with srequest]
+
+To see a list of your srequests to wcalpha, use something like the following:
+
+  $ sreq --abstract wcalphaos-*-agriffis
+  wcalphaos-633-agriffis: alt driver: MAC address fixes, vMAC promisc
+  wcalphaos-859-agriffis: Merge of V51ASUPPORT BL2 into WCALPHA BL3
+
+To show the QARs addressed by those srequests, do:
+
+  $ sreq --qars wcalphaos-*-agriffis
+  wcalphaos-633-agriffis: 89295 89838 82052 89637
+  wcalphaos-859-agriffis: 
+
+To search by QAR number and output in simple list format:
+
+  $ sreq --list --qar=89637
+  wcalphaos-633-agriffis
+
+To show the siblings for a given srequest:
+
+  $ sreq --list --siblings v51asupportos-272-amg
+  v40fsupportos-855-amg
+  v51asupportos-646-amg
+  v51supportos-816-amg
+  v50asupportos-671-amg
+  v40gsupportos-485-amg
+
+To search by file modified and output the abstracts:
+
+  $ sreq --abstract --file=bcm.c indepos-*-agriffis
+  indepos-24-agriffis: Initial submit of bcm driver V1.0.1 to indepos
+  indepos-25-agriffis: Submit bcm driver V1.0.2 with additional 0x1646
+  indepos-32-agriffis: bcm V1.0.4 with 5704 support
+
+To sign off an srequest after you've verified it:
+
+  $ sreq --signoff v51bsupportos-1234-harvey
+
+=head1 ENVIRONMENT VARIABLES
+
+=over
+
+=item PAGER
+
+The PAGER variable is honored when viewing srequest texts.
+
+=back
+
+=head1 NOTES
+
+This tool was written by Aron Griffis.  It was inspired by Ric Werme's qar
+lookup tool, which functions similarly for qars instead of srequests.  Sreq
+was originally written in Perl then was translated to Ruby for continued
+development.
+
+I don't like how rdtool formats this man-page, so I did it in pod.  :-b
+
+# vim:sw=2:
